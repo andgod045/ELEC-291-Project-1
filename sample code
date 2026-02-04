@@ -1,68 +1,167 @@
+; Reflow Controller - Debug Mode
+; Left Displays (5-3): LM335 Raw Value
+; Right Displays (2-0): Thermocouple Raw Value
+
 $NOLIST
 $MODMAX10
 $LIST
 
-; Reset vector
-org 0x0000
+; --- CLOCK ---
+CLK           EQU 33333333 
+TIMER0_RELOAD EQU (65536-(CLK/1000))
+
+; --- PINS ---
+ELCD_RS      EQU P1.3
+ELCD_E       EQU P1.4
+ELCD_RW      EQU P0.5    
+ELCD_D4      EQU P1.0
+ELCD_D5      EQU P0.6
+ELCD_D6      EQU P0.4
+ELCD_D7      EQU P0.2
+
+OVEN_PIN     EQU P0.0
+BTN_PIN      EQU P0.1
+
+ORG 0x0000
     ljmp main
 
-; --- YOUR ORIGINAL DELAY ---
-delay:
-    mov R2, #50
-L3: mov R1, #250
-L2: mov R0, #250
-L1: djnz R0, L1
-    djnz R1, L2
-    djnz R2, L3
+; --- VARIABLES ---
+DSEG at 30H
+x:          ds 4
+y:          ds 4
+bcd:        ds 5
+VAL_TC:     ds 2
+VAL_ROOM:   ds 2
+
+BSEG
+oven_active: dbit 1
+mf:          dbit 1
+
+$NOLIST
+$include(LCD_4bit_DE10Lite.inc) 
+$include(math32.inc)
+$LIST
+
+; --- 7-SEG LUT ---
+LUT_7SEG: DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90
+
+Init_All:
+    mov TMOD, #01H
+    mov P0MOD, #75H 
+    mov P1MOD, #19H 
+    clr OVEN_PIN
+    clr oven_active
+    setb BTN_PIN
     ret
 
-; --- NEW SHORT DELAY FOR DEBOUNCE (Approx 20ms) ---
-debounce_delay:
-    mov R2, #2      ; Run the delay loop only 2 times (approx 20ms)
-    sjmp L3         ; Jump into the existing delay logic
+Read_ADC_DE10:
+    mov ADC_C, a        
+    orl ADC_C, #080H    ; Reset
+    nop
+    anl ADC_C, #07FH    ; Start
+    Wait_Milli_Seconds(#1)
+    mov a, ADC_L
+    mov R0, a
+    mov a, ADC_H
+    mov R1, a
+    ret
+
+; --- DEBUG DISPLAY ROUTINE ---
+Update_Split_Display:
+    mov dptr, #LUT_7SEG
+
+    ; --- 1. DISPLAY LM335 (Variable x) on HEX 5, 4, 3 ---
+    ; Convert x to BCD
+    lcall hex2bcd
+    
+    ; HEX3 (Ones)
+    mov a, bcd+0
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX3, a
+
+    ; HEX4 (Tens)
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX4, a
+
+    ; HEX5 (Hundreds)
+    mov a, bcd+1
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX5, a
+
+    ; --- 2. DISPLAY THERMOCOUPLE (Variable y) on HEX 2, 1, 0 ---
+    ; Move Y to X to use hex2bcd
+    mov x+0, y+0
+    mov x+1, y+1
+    mov x+2, #0
+    mov x+3, #0
+    lcall hex2bcd
+
+    ; HEX0 (Ones)
+    mov a, bcd+0
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX0, a
+
+    ; HEX1 (Tens)
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX1, a
+
+    ; HEX2 (Hundreds)
+    mov a, bcd+1
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX2, a
+    
+    ret
 
 main:
-    mov SP, #0x7f
+    mov SP, #0x7F
+    lcall Init_All
+    lcall ELCD_4BIT
     
-    ; --- PIN CONFIGURATION FIX ---
-    ; P0.0 is Oven (Output -> 1)
-    ; P0.1 is Button (Input -> 0)
-    ; Binary: 1111 1101 = 0xFD
-    mov P0MOD, #0xFD
-    mov P1MOD, #0xff
+Loop:
+    ; 1. READ ROOM TEMP (A1) -> Stored in X
+    mov a, #1
+    lcall Read_ADC_DE10
+    mov x+0, R0
+    mov x+1, R1
+    mov x+2, #0
+    mov x+3, #0
     
-    ; --- INIT STATES ---
-    setb P0.1       ; Enable Pull-up on Button Pin (IMPORTANT!)
-    clr P0.0        ; Start with Oven OFF
-    mov R3, #0      ; R3 will be our "Status Flag" (0=OFF, 1=ON)
+    ; 2. READ THERMOCOUPLE (A0) -> Stored in Y
+    mov a, #0
+    lcall Read_ADC_DE10
+    mov y+0, R0
+    mov y+1, R1
+    mov y+2, #0
+    mov y+3, #0
+    
+    ; 3. UPDATE DISPLAYS
+    lcall Update_Split_Display
+    
+    ; 4. OVEN LOGIC (Kept simple)
+    jb BTN_PIN, Skip_Btn
+    Wait_Milli_Seconds(#20)
+    jb BTN_PIN, Skip_Btn
+    cpl oven_active
+    jnb BTN_PIN, $
+Skip_Btn:
+    jnb oven_active, Stop_Oven
+    cpl OVEN_PIN
+    sjmp Delay
+Stop_Oven:
+    clr OVEN_PIN
 
-loop:
-    ; --- 1. CHECK BUTTON (Active Low) ---
-    jb P0.1, check_status   ; If P0.1 is High (1), button is NOT pressed. Skip.
-
-    ; Button Detected! Debounce it.
-    lcall debounce_delay
-    jb P0.1, check_status   ; If high again, it was just noise. Skip.
-
-    ; Valid Press: Toggle the Status Flag (R3)
-    cjne R3, #0, set_off    ; If R3 is not 0, turn it off
-    mov R3, #1              ; Set ON
-    sjmp wait_for_release
-set_off:
-    mov R3, #0              
-    clr P0.0                ; Safety: Ensure oven turns off immediately
-
-wait_for_release:
-    jnb P0.1, $             ; Pause here until user releases button
-    lcall debounce_delay    ; Delay slightly after release to prevent double-toggle
-
-check_status:
-    ; --- 2. ACT ON STATUS ---
-    cjne R3, #1, loop       ; If R3 is 0, jump back to start (Don't pulse)
-
-    ; --- 3. PULSE LOGIC (Only runs if R3=1) ---
-    cpl P0.0
-    lcall delay
-    ljmp loop
+Delay:
+    Wait_Milli_Seconds(#250)
+    ljmp Loop
 
 END
