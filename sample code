@@ -1,0 +1,68 @@
+$NOLIST
+$MODMAX10
+$LIST
+
+; Reset vector
+org 0x0000
+    ljmp main
+
+; --- YOUR ORIGINAL DELAY ---
+delay:
+    mov R2, #50
+L3: mov R1, #250
+L2: mov R0, #250
+L1: djnz R0, L1
+    djnz R1, L2
+    djnz R2, L3
+    ret
+
+; --- NEW SHORT DELAY FOR DEBOUNCE (Approx 20ms) ---
+debounce_delay:
+    mov R2, #2      ; Run the delay loop only 2 times (approx 20ms)
+    sjmp L3         ; Jump into the existing delay logic
+
+main:
+    mov SP, #0x7f
+    
+    ; --- PIN CONFIGURATION FIX ---
+    ; P0.0 is Oven (Output -> 1)
+    ; P0.1 is Button (Input -> 0)
+    ; Binary: 1111 1101 = 0xFD
+    mov P0MOD, #0xFD
+    mov P1MOD, #0xff
+    
+    ; --- INIT STATES ---
+    setb P0.1       ; Enable Pull-up on Button Pin (IMPORTANT!)
+    clr P0.0        ; Start with Oven OFF
+    mov R3, #0      ; R3 will be our "Status Flag" (0=OFF, 1=ON)
+
+loop:
+    ; --- 1. CHECK BUTTON (Active Low) ---
+    jb P0.1, check_status   ; If P0.1 is High (1), button is NOT pressed. Skip.
+
+    ; Button Detected! Debounce it.
+    lcall debounce_delay
+    jb P0.1, check_status   ; If high again, it was just noise. Skip.
+
+    ; Valid Press: Toggle the Status Flag (R3)
+    cjne R3, #0, set_off    ; If R3 is not 0, turn it off
+    mov R3, #1              ; Set ON
+    sjmp wait_for_release
+set_off:
+    mov R3, #0              
+    clr P0.0                ; Safety: Ensure oven turns off immediately
+
+wait_for_release:
+    jnb P0.1, $             ; Pause here until user releases button
+    lcall debounce_delay    ; Delay slightly after release to prevent double-toggle
+
+check_status:
+    ; --- 2. ACT ON STATUS ---
+    cjne R3, #1, loop       ; If R3 is 0, jump back to start (Don't pulse)
+
+    ; --- 3. PULSE LOGIC (Only runs if R3=1) ---
+    cpl P0.0
+    lcall delay
+    ljmp loop
+
+END
