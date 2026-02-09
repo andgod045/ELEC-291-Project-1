@@ -1,0 +1,128 @@
+import serial
+import serial.tools.list_ports
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from collections import deque
+import time
+import re
+import sys
+
+# --- CONFIGURATION ---
+BAUD_RATE = 115200
+MAX_POINTS = 300       # Show last 300 seconds (5 minutes)
+Y_MIN = 0              # Min Temp on Graph
+Y_MAX = 260            # Max Temp
+
+# --- AUTO-DETECT PORT FUNCTION ---
+def get_serial_port():
+    ports = list(serial.tools.list_ports.comports())
+    
+    if not ports:
+        print("\n❌ NO SERIAL DEVICES FOUND!")
+        print("   - Check your USB cable.")
+        print("   - Check if the drivers are installed.")
+        sys.exit()
+        
+    # Filter out likely non-relevant ports (optional, keeps list clean)
+    # real_ports = [p for p in ports if 'Bluetooth' not in p.description] 
+    real_ports = ports # Use all for now to be safe
+
+    if len(real_ports) == 1:
+        print(f"✅ Automatically detected: {real_ports[0].device} ({real_ports[0].description})")
+        return real_ports[0].device
+    
+    print("\n🔍 Multiple ports found. Please select one:")
+    for i, p in enumerate(real_ports):
+        print(f"   [{i}] {p.device} - {p.description}")
+        
+    while True:
+        try:
+            selection = int(input("\n   Enter number (0, 1, etc): "))
+            if 0 <= selection < len(real_ports):
+                return real_ports[selection].device
+        except ValueError:
+            pass
+        print("   Invalid selection. Try again.")
+
+# --- GET PORT ---
+SERIAL_PORT = get_serial_port()
+
+# --- DATA STORAGE ---
+x_data = deque(maxlen=MAX_POINTS)
+y_data = deque(maxlen=MAX_POINTS)
+start_time = time.time()
+
+# --- CONNECT TO SERIAL ---
+try:
+    print(f"🔌 Connecting to {SERIAL_PORT} @ {BAUD_RATE}...")
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    ser.reset_input_buffer() # Clear old data
+    print("🚀 Connected! Waiting for temperature data...")
+except Exception as e:
+    print(f"\n❌ ERROR: Could not connect to {SERIAL_PORT}.")
+    print(f"   Details: {e}")
+    sys.exit()
+
+# --- SETUP PLOT ---
+fig, ax = plt.subplots()
+line, = ax.plot([], [], 'r-', linewidth=2, label='PCB Temp')
+ax.set_ylim(Y_MIN, Y_MAX)
+ax.set_xlim(0, 60) # Initial window size
+ax.set_title(f'Reflow Oven Profile ({SERIAL_PORT})')
+ax.set_xlabel('Time (seconds)')
+ax.set_ylabel('Temperature (°C)')
+ax.grid(True, linestyle='--', alpha=0.7)
+
+# Add target lines for Reflow Profile
+ax.axhline(y=150, color='g', linestyle=':', label='Soak Target (150°C)')
+ax.axhline(y=220, color='b', linestyle=':', label='Reflow Peak (220°C)')
+ax.legend(loc='upper left')
+
+def update(frame):
+    if ser.in_waiting:
+        try:
+            # Read line: "T:XXX" or "T:XX"
+            raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+            
+            # Regex to find "T:NUMBER" 
+            # This ignores extra noise like "State:1" if you print that too
+            match = re.search(r'T:(\d+)', raw_line)
+            
+            if match:
+                # Extract temperature
+                temp_val = float(match.group(1))
+                
+                # Calculate time
+                elapsed = time.time() - start_time
+                
+                # Append to buffers
+                x_data.append(elapsed)
+                y_data.append(temp_val)
+                
+                # Update Graph
+                line.set_data(x_data, y_data)
+                
+                # Auto-scroll X-Axis
+                if elapsed > 60:
+                    ax.set_xlim(elapsed - 60, elapsed + 5)
+                else:
+                    ax.set_xlim(0, 60)
+                
+                # Print to console (overwrite line for clean look)
+                print(f"\r⏳ Time: {elapsed:.1f}s | 🌡️ Temp: {temp_val}°C", end="")
+                    
+        except ValueError:
+            pass # Ignore corrupted lines
+        except Exception as e:
+            print(f"\nError: {e}")
+
+    return line,
+
+# --- RUN ANIMATION ---
+# Interval 50ms = 20 updates per second
+ani = animation.FuncAnimation(fig, update, interval=50, cache_frame_data=False)
+plt.show()
+
+# Clean up on close
+ser.close()
+print("\nDisconnected.")
