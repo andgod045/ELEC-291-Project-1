@@ -1,0 +1,383 @@
+; Reflow Oven Controller - FIXED PINS
+; Button: P0.1 | Oven: P0.0
+; FSM: Wait -> Preheat(150C) -> Soak(60s) -> Reflow(220C) -> Cool(60C)
+
+$NOLIST
+$MODMAX10
+$LIST
+
+; --- 1. RESET VECTOR ---
+ORG 0x0000
+    ljmp main
+
+; --- 2. VARIABLES ---
+DSEG at 30H
+x:          ds 4    
+y:          ds 4    
+bcd:        ds 5    
+TEMP_ROOM:  ds 4    
+TEMP_TC:    ds 4    
+TEMP_TOTAL: ds 4    
+
+; FSM & Timing
+state:      ds 1    ; Current State (0-4)
+sec_count:  ds 1    ; Seconds counter
+tick_count: ds 1    ; 100ms ticks
+power_lvl:  ds 1    ; 0=Off, 1=20%, 5=100%
+
+BSEG
+mf:         dbit 1  
+
+; --- 3. INCLUDES ---
+$NOLIST
+$include(math32.inc)
+$LIST
+
+; --- 4. HARDWARE DEFINITIONS ---
+LUT: DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90
+
+BTN_PIN     EQU P0.1   ; <--- FIXED: Now P0.1
+OVEN_PIN    EQU P0.0   ; Oven Relay
+TXD_PIN     EQU P1.2   ; Serial Transmit
+
+; --- 5. INITIALIZATION ---
+Init:
+    mov SP, #0x7F
+    
+    ; Port 0 Configuration
+    ; We need P0.0 = Output (1) for Oven
+    ; We need P0.1 = Input (0) for Button
+    ; P0MOD: 1 = Output, 0 = Input.
+    ; Let's make P0.0 Output, everything else Input to be safe.
+    mov P0MOD, #01H 
+    
+    ; Port 1 Configuration (P1.2 TXD is Output)
+    mov P1MOD, #04H
+    
+    ; Init Variables
+    mov state, #0
+    mov sec_count, #0
+    mov tick_count, #0
+    mov power_lvl, #0
+    
+    ; Init Pins
+    clr OVEN_PIN     ; Turn Oven OFF
+    setb BTN_PIN     ; Turn on Pull-up for Button Input
+    setb TXD_PIN     ; Idle High for Serial
+    ret
+
+; --- 6. DELAY (50ms) ---
+Wait50ms:
+    mov R0, #30
+L3: mov R1, #74
+L2: mov R2, #250
+L1: djnz R2, L1 
+    djnz R1, L2 
+    djnz R0, L3 
+    ret
+
+; --- 7. ADC READ (Returns mV) ---
+Read_ADC_mV:
+    mov ADC_C, a        
+    orl ADC_C, #0x80    ; Reset
+    nop
+    anl ADC_C, #0x7F    ; Start
+    lcall Wait50ms      ; Wait 50ms
+    
+    mov x+0, ADC_L
+    mov x+1, ADC_H
+    mov x+2, #0
+    mov x+3, #0
+    
+    Load_y(5000)        ; Vref = 5.0V
+    lcall mul32
+    Load_y(4096)
+    lcall div32
+    ret
+
+; --- 8. STATE MACHINE ---
+FSM_Update:
+    mov a, state
+    cjne a, #0, Check_S1
+    ljmp State0_Wait
+Check_S1:
+    cjne a, #1, Check_S2
+    ljmp State1_Preheat
+Check_S2:
+    cjne a, #2, Check_S3
+    ljmp State2_Soak
+Check_S3:
+    cjne a, #3, Check_S4
+    ljmp State3_Reflow
+Check_S4:
+    ljmp State4_Cool
+
+; [S0] WAITING
+State0_Wait:
+    mov power_lvl, #0
+    
+    ; Check Button (P0.1)
+    ; JNB = Jump if Bit is Clear (Low). 
+    ; If button connects to Ground, JNB jumps when pressed.
+    jnb BTN_PIN, Start_Process
+    ret
+    
+Start_Process:
+    ; Wait for release (optional, but good for debounce)
+    ; jnb BTN_PIN, $ 
+    
+    mov state, #1
+    mov sec_count, #0
+    ret
+
+; [S1] PREHEAT (100% to 150C)
+State1_Preheat:
+    mov power_lvl, #5
+    
+    mov x+0, TEMP_TOTAL+0
+    mov x+1, TEMP_TOTAL+1
+    mov x+2, #0
+    mov x+3, #0
+    Load_y(150)
+    lcall x_gt_y
+    jnb mf, Ret_FSM
+    
+    mov state, #2
+    mov sec_count, #0
+    ret
+
+; [S2] SOAK (20% for 60s)
+State2_Soak:
+    mov power_lvl, #1
+    
+    mov a, sec_count
+    cjne a, #60, Check_Time
+    sjmp Soak_Done
+Check_Time:
+    jc Ret_FSM
+Soak_Done:
+    mov state, #3
+    ret
+
+; [S3] REFLOW (100% to 220C)
+State3_Reflow:
+    mov power_lvl, #5
+    
+    mov x+0, TEMP_TOTAL+0
+    mov x+1, TEMP_TOTAL+1
+    mov x+2, #0
+    mov x+3, #0
+    Load_y(220)
+    lcall x_gt_y
+    jnb mf, Ret_FSM
+    
+    mov state, #4
+    ret
+
+; [S4] COOL (0% to 60C)
+State4_Cool:
+    mov power_lvl, #0
+    
+    mov x+0, TEMP_TOTAL+0
+    mov x+1, TEMP_TOTAL+1
+    mov x+2, #0
+    mov x+3, #0
+    Load_y(60)
+    lcall x_lt_y
+    jnb mf, Ret_FSM
+    
+    mov state, #0
+    ret
+
+Ret_FSM:
+    ret
+
+; --- 9. PWM & TIMER (Called every 100ms) ---
+Update_Timing:
+    inc tick_count
+    mov a, tick_count
+    cjne a, #10, PWM_Logic
+    
+    ; 1 Second Passed
+    mov tick_count, #0
+    inc sec_count
+    
+PWM_Logic:
+    mov a, power_lvl
+    
+    ; Level 5 (100%): ON
+    cjne a, #5, Check_20
+    setb OVEN_PIN
+    ret
+
+Check_20:
+    ; Level 1 (20%): ON for ticks 0,1. OFF for 2-9.
+    cjne a, #1, Force_Off
+    mov a, tick_count
+    cjne a, #2, Cmp_Ticks
+    sjmp Turn_Off
+Cmp_Ticks:
+    jc Turn_On 
+Turn_Off:
+    clr OVEN_PIN
+    ret
+Turn_On:
+    setb OVEN_PIN
+    ret
+
+Force_Off:
+    clr OVEN_PIN
+    ret
+
+; --- 10. MAIN LOOP ---
+main:
+    lcall Init
+    
+Loop:
+    ; A. LM335 (Ch 1)
+    mov a, #1
+    lcall Read_ADC_mV    
+    Load_y(10)
+    lcall div32
+    Load_y(273)
+    lcall sub32
+    mov TEMP_ROOM+0, x+0
+    mov TEMP_ROOM+1, x+1
+    mov TEMP_ROOM+2, x+2
+    mov TEMP_ROOM+3, x+3
+    
+    ; B. Thermocouple (Ch 0)
+    mov a, #0
+    lcall Read_ADC_mV    
+    Load_y(1000)
+    lcall mul32
+    Load_y(12300)        
+    lcall div32
+    mov TEMP_TC+0, x+0
+    mov TEMP_TC+1, x+1
+    mov TEMP_TC+2, x+2
+    mov TEMP_TC+3, x+3
+    
+    ; C. Total Temp
+    mov y+0, TEMP_ROOM+0
+    mov y+1, TEMP_ROOM+1
+    mov y+2, TEMP_ROOM+2
+    mov y+3, TEMP_ROOM+3
+    lcall add32
+    mov TEMP_TOTAL+0, x+0
+    mov TEMP_TOTAL+1, x+1
+    mov TEMP_TOTAL+2, x+2
+    mov TEMP_TOTAL+3, x+3
+    
+    ; D. Logic
+    lcall FSM_Update
+    lcall Update_Timing
+    
+    ; E. Display
+    mov dptr, #LUT
+
+    ; Left: Temp
+    mov x+0, TEMP_TOTAL+0
+    mov x+1, TEMP_TOTAL+1
+    mov x+2, TEMP_TOTAL+2
+    mov x+3, TEMP_TOTAL+3
+    lcall hex2bcd
+    
+    mov a, bcd+0
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX3, a
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX4, a
+    mov a, bcd+1
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX5, a
+    
+    ; Right: State (HEX0) & Time (HEX 2-1)
+    mov a, state
+    movc a, @a+dptr
+    mov HEX0, a
+    
+    mov x+0, sec_count
+    mov x+1, #0
+    mov x+2, #0
+    mov x+3, #0
+    lcall hex2bcd
+    
+    mov a, bcd+0
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX1, a
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX2, a
+    
+    lcall Send_Temp_Serial
+
+    ljmp Loop
+
+; --- SERIAL ---
+Send_Temp_Serial:
+    mov a, #'T'
+    lcall PutChar
+    mov a, #':'
+    lcall PutChar
+    
+    mov x+0, TEMP_TOTAL+0
+    mov x+1, TEMP_TOTAL+1
+    mov x+2, TEMP_TOTAL+2
+    mov x+3, TEMP_TOTAL+3
+    lcall hex2bcd
+    
+    mov a, bcd+1
+    anl a, #0x0F
+    add a, #'0'
+    lcall PutChar
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    add a, #'0'
+    lcall PutChar
+    mov a, bcd+0
+    anl a, #0x0F
+    add a, #'0'
+    lcall PutChar
+    
+    mov a, #10
+    lcall PutChar
+    mov a, #13
+    lcall PutChar
+    ret
+
+PutChar:
+    push acc
+    clr TXD_PIN
+    mov R2, #3
+    lcall Wait_Bit
+    mov R3, #8
+Send_Bit:
+    rrc a
+    mov TXD_PIN, c
+    mov R2, #3
+    lcall Wait_Bit
+    djnz R3, Send_Bit
+    setb TXD_PIN
+    mov R2, #3
+    lcall Wait_Bit
+    pop acc
+    ret
+
+Wait_Bit:
+    mov R0, #28
+L_Wait:
+    djnz R0, L_Wait
+    djnz R2, Wait_Bit
+    ret
+
+END
