@@ -8,21 +8,33 @@ ORG 0x0000
 
 ; --- 2. VARIABLES ---
 DSEG at 30H
-x:          ds 4    
-y:          ds 4    
-bcd:        ds 5    
-TEMP_ROOM:  ds 4    
-TEMP_TC:    ds 4    
-TEMP_TOTAL: ds 4    
+x:          ds 4
+y:          ds 4
+bcd:        ds 5
+TEMP_ROOM:  ds 4
+TEMP_TC:    ds 4
+TEMP_TOTAL: ds 4
+TEMP_PEAK:  ds 4
 
 ; FSM & Timing Variables
-state:      ds 1    
-sec_count:  ds 1    
-tick_count: ds 1    
-power_lvl:  ds 1    
+state:      ds 1
+sec_count:  ds 1
+tick_count: ds 1
+power_lvl:  ds 1
+ui_mode:    ds 1
+profile_idx: ds 1
+btn1_last:  ds 1
+btn2_last:  ds 1
+btn1_event: ds 1
+btn2_event: ds 1
+total_sec:  ds 2
+ui_tick:    ds 1
+summary_sec: ds 1
+lcd_page:   ds 1
+cycle_done: ds 1
 
 BSEG
-mf:         dbit 1  
+mf:         dbit 1
 
 ; --- 3. PIN DEFINITIONS ---
 ; LCD Pins (Renamed to ELCD_ to match the library)
@@ -35,6 +47,7 @@ ELCD_D7 equ P0.3
 
 ; System Pins
 BTN_PIN     EQU P0.1   ; Input (Button)
+BTN2_PIN    EQU P0.6   ; Input (Start)
 OVEN_PIN    EQU P0.0   ; Output (Oven)
 TXD_PIN     EQU P1.2   ; Output (Serial)
 
@@ -46,12 +59,28 @@ $LIST
 
 ; --- 5. CONSTANTS ---
 LUT: DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90
-Msg_Start: db 'Hello!!!', 0
+Msg_L1:     db 'Temp:', 0
+Msg_L2:     db 'S', 0
+Msg_Tgt:    db ' Tgt:', 0
+Msg_Menu1:  db 'Select Profile', 0
+Msg_Sum1:   db 'Done ', 0
+
+Profile_Names:
+    db 'LEAD'
+    db 'LFRE'
+    db 'LOW '
+
+; Profile params per index: 0..2
+Profile_Preheat_Targets: db 150, 150, 130
+Profile_Soak_Targets:    db 150, 170, 140
+Profile_Soak_Times:      db 60,  90,  45
+Profile_Reflow_Targets:  db 220, 235, 200
+Profile_Cool_Targets:    db 60,  60,  60
 
 ; --- 6. INITIALIZATION ---
 Init:
     mov SP, #0x7F
-    
+
     ; --- PORT 0 CONFIGURATION (P0MOD) ---
     ; P0.7 (LCD D5) -> Output (1)
     ; P0.6 (Unused) -> Input  (0)
@@ -63,58 +92,68 @@ Init:
     ; P0.0 (Oven)   -> Output (1)
     ; Binary: 1011 1101 = 0xBD
     mov P0MOD, #0xBD
-    
+
     ; --- PORT 1 CONFIGURATION (P1MOD) ---
     ; P1.2 (TXD)    -> Output (1)
     ; P1.1 (LCD D4) -> Output (1)
     ; Others        -> Input  (0)
     ; Binary: 0000 0110 = 0x06
     mov P1MOD, #0x06
-    
+
     ; --- STATE VARIABLES ---
     mov state, #0
     mov sec_count, #0
     mov tick_count, #0
     mov power_lvl, #0
-    
+    mov ui_mode, #0
+    mov profile_idx, #0
+    mov btn1_last, #1
+    mov btn2_last, #1
+    mov btn1_event, #0
+    mov btn2_event, #0
+    mov total_sec+0, #0
+    mov total_sec+1, #0
+    mov ui_tick, #0
+    mov summary_sec, #0
+    mov lcd_page, #0
+    mov cycle_done, #0
+
     ; --- INITIAL PIN STATES ---
     clr OVEN_PIN     ; Safety: Oven OFF
     setb BTN_PIN     ; Enable Pull-up for Button Input
+    setb BTN2_PIN    ; Enable Pull-up for Button Input
     setb TXD_PIN     ; Idle High for Serial
-    
+
     ; --- LCD SETUP ---
     lcall ELCD_4BIT  ; Initialize LCD
-    
-    Set_Cursor(1, 1)
-    Send_Constant_String(#Msg_Start)
-    
+
     ret
 
 ; --- 7. DELAY (50ms) ---
 Wait50ms:
     mov R0, #30
-Wait_L3: 
+Wait_L3:
     mov R1, #74
-Wait_L2: 
+Wait_L2:
     mov R2, #250
-Wait_L1: 
-    djnz R2, Wait_L1 
-    djnz R1, Wait_L2 
-    djnz R0, Wait_L3 
+Wait_L1:
+    djnz R2, Wait_L1
+    djnz R1, Wait_L2
+    djnz R0, Wait_L3
     ret
 ; --- 7. ADC READ (Returns mV) ---
 Read_ADC_mV:
-    mov ADC_C, a        
+    mov ADC_C, a
     orl ADC_C, #0x80    ; Reset
     nop
     anl ADC_C, #0x7F    ; Start
     lcall Wait50ms      ; Wait 50ms
-    
+
     mov x+0, ADC_L
     mov x+1, ADC_H
     mov x+2, #0
     mov x+3, #0
-    
+
     Load_y(5000)        ; Vref = 5.0V
     lcall mul32
     Load_y(4096)
@@ -141,78 +180,70 @@ Check_S4:
 ; [S0] WAITING
 State0_Wait:
     mov power_lvl, #0
-    
-    ; Check Button (P0.1)
-    ; JNB = Jump if Bit is Clear (Low). 
-    ; If button connects to Ground, JNB jumps when pressed.
-    jnb BTN_PIN, Start_Process
-    ret
-    
-Start_Process:
-    ; Wait for release (optional, but good for debounce)
-    ; jnb BTN_PIN, $ 
-    
-    mov state, #1
-    mov sec_count, #0
     ret
 
-; [S1] PREHEAT (100% to 150C)
+; [S1] PREHEAT
 State1_Preheat:
     mov power_lvl, #5
-    
+
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, #0
     mov x+3, #0
-    Load_y(150)
+    lcall Load_Target_Y
     lcall x_gt_y
     jnb mf, Ret_FSM
-    
+
     mov state, #2
     mov sec_count, #0
     ret
 
-; [S2] SOAK (20% for 60s)
+; [S2] SOAK
 State2_Soak:
     mov power_lvl, #1
-    
+
+    lcall Get_Soak_Time
+    mov b, a
     mov a, sec_count
-    cjne a, #60, Check_Time
+    cjne a, b, Check_Time
     sjmp Soak_Done
 Check_Time:
     jc Ret_FSM
 Soak_Done:
     mov state, #3
+    mov sec_count, #0
     ret
 
-; [S3] REFLOW (100% to 220C)
+; [S3] REFLOW
 State3_Reflow:
     mov power_lvl, #5
-    
+
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, #0
     mov x+3, #0
-    Load_y(220)
+    lcall Load_Target_Y
     lcall x_gt_y
     jnb mf, Ret_FSM
-    
+
     mov state, #4
+    mov sec_count, #0
     ret
 
-; [S4] COOL (0% to 60C)
+; [S4] COOL
 State4_Cool:
     mov power_lvl, #0
-    
+
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, #0
     mov x+3, #0
-    Load_y(60)
+    lcall Load_Target_Y
     lcall x_lt_y
     jnb mf, Ret_FSM
-    
+
     mov state, #0
+    mov cycle_done, #1
     ret
 
 Ret_FSM:
@@ -223,14 +254,19 @@ Update_Timing:
     inc tick_count
     mov a, tick_count
     cjne a, #10, PWM_Logic
-    
+
     ; 1 Second Passed
     mov tick_count, #0
     inc sec_count
-    
+    inc total_sec+0
+    mov a, total_sec+0
+    jnz Skip_Total_Inc
+    inc total_sec+1
+Skip_Total_Inc:
+
 PWM_Logic:
     mov a, power_lvl
-    
+
     ; Level 5 (100%): ON
     cjne a, #5, Check_20
     setb OVEN_PIN
@@ -243,7 +279,7 @@ Check_20:
     cjne a, #2, Cmp_Ticks
     sjmp Turn_Off
 Cmp_Ticks:
-    jc Turn_On 
+    jc Turn_On
 Turn_Off:
     clr OVEN_PIN
     ret
@@ -258,11 +294,11 @@ Force_Off:
 ; --- 10. MAIN LOOP ---
 main:
     lcall Init
-    
+
 Loop:
     ; A. LM335 (Ch 1)
     mov a, #1
-    lcall Read_ADC_mV    
+    lcall Read_ADC_mV
     Load_y(10)
     lcall div32
     Load_y(273)
@@ -271,19 +307,19 @@ Loop:
     mov TEMP_ROOM+1, x+1
     mov TEMP_ROOM+2, x+2
     mov TEMP_ROOM+3, x+3
-    
+
     ; B. Thermocouple (Ch 0)
     mov a, #0
-    lcall Read_ADC_mV    
+    lcall Read_ADC_mV
     Load_y(1000)
     lcall mul32
-    Load_y(12300)        
+    Load_y(12300)
     lcall div32
     mov TEMP_TC+0, x+0
     mov TEMP_TC+1, x+1
     mov TEMP_TC+2, x+2
     mov TEMP_TC+3, x+3
-    
+
     ; C. Total Temp
     mov y+0, TEMP_ROOM+0
     mov y+1, TEMP_ROOM+1
@@ -294,11 +330,12 @@ Loop:
     mov TEMP_TOTAL+1, x+1
     mov TEMP_TOTAL+2, x+2
     mov TEMP_TOTAL+3, x+3
-    
+
     ; D. Logic
-    lcall FSM_Update
-    lcall Update_Timing
-    
+    lcall Read_Buttons
+    lcall UI_Update
+    lcall LCD_Update
+
     ; E. Display
     mov dptr, #LUT
 
@@ -308,7 +345,7 @@ Loop:
     mov x+2, TEMP_TOTAL+2
     mov x+3, TEMP_TOTAL+3
     lcall hex2bcd
-    
+
     mov a, bcd+0
     anl a, #0x0F
     movc a, @a+dptr
@@ -322,18 +359,18 @@ Loop:
     anl a, #0x0F
     movc a, @a+dptr
     mov HEX5, a
-    
+
     ; Right: State (HEX0) & Time (HEX 2-1)
     mov a, state
     movc a, @a+dptr
     mov HEX0, a
-    
+
     mov x+0, sec_count
     mov x+1, #0
     mov x+2, #0
     mov x+3, #0
     lcall hex2bcd
-    
+
     mov a, bcd+0
     anl a, #0x0F
     movc a, @a+dptr
@@ -343,7 +380,7 @@ Loop:
     anl a, #0x0F
     movc a, @a+dptr
     mov HEX2, a
-    
+
     lcall Send_Temp_Serial
 
     ljmp Loop
@@ -354,13 +391,13 @@ Send_Temp_Serial:
     lcall PutChar
     mov a, #':'
     lcall PutChar
-    
+
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, TEMP_TOTAL+2
     mov x+3, TEMP_TOTAL+3
     lcall hex2bcd
-    
+
     mov a, bcd+1
     anl a, #0x0F
     add a, #'0'
@@ -374,12 +411,412 @@ Send_Temp_Serial:
     anl a, #0x0F
     add a, #'0'
     lcall PutChar
-    
+
     mov a, #10
     lcall PutChar
     mov a, #13
     lcall PutChar
     ret
+
+; --- UI & BUTTONS ---
+Read_Buttons:
+    mov btn1_event, #0
+    mov btn2_event, #0
+
+    mov a, btn1_last
+    jnb BTN_PIN, Btn1_Low
+    mov btn1_last, #1
+    sjmp Btn1_Done
+Btn1_Low:
+    cjne a, #0, Btn1_Press
+    sjmp Btn1_Done
+Btn1_Press:
+    mov btn1_last, #0
+    mov btn1_event, #1
+Btn1_Done:
+
+    mov a, btn2_last
+    jnb BTN2_PIN, Btn2_Low
+    mov btn2_last, #1
+    sjmp Btn2_Done
+Btn2_Low:
+    cjne a, #0, Btn2_Press
+    sjmp Btn2_Done
+Btn2_Press:
+    mov btn2_last, #0
+    mov btn2_event, #1
+Btn2_Done:
+    ret
+
+UI_Update:
+    mov a, ui_mode
+    cjne a, #0, UI_Check_Run
+    lcall Menu_Update
+    ret
+UI_Check_Run:
+    cjne a, #1, UI_Check_Summary
+    lcall Running_Update
+    ret
+UI_Check_Summary:
+    lcall Summary_Update
+    ret
+
+Menu_Update:
+    mov power_lvl, #0
+    clr OVEN_PIN
+
+    mov a, btn1_event
+    jz Menu_NoNext
+    inc profile_idx
+    mov a, profile_idx
+    cjne a, #3, Menu_NoNext
+    mov profile_idx, #0
+Menu_NoNext:
+
+    mov a, btn2_event
+    jz Menu_Done
+    mov ui_mode, #1
+    mov state, #1
+    mov sec_count, #0
+    mov tick_count, #0
+    mov total_sec+0, #0
+    mov total_sec+1, #0
+    mov lcd_page, #0
+    mov cycle_done, #0
+    mov TEMP_PEAK+0, #0
+    mov TEMP_PEAK+1, #0
+    mov TEMP_PEAK+2, #0
+    mov TEMP_PEAK+3, #0
+Menu_Done:
+    ret
+
+Running_Update:
+    lcall FSM_Update
+    lcall Update_Timing
+
+    ; Track peak temp
+    mov x+0, TEMP_TOTAL+0
+    mov x+1, TEMP_TOTAL+1
+    mov x+2, TEMP_TOTAL+2
+    mov x+3, TEMP_TOTAL+3
+    mov y+0, TEMP_PEAK+0
+    mov y+1, TEMP_PEAK+1
+    mov y+2, TEMP_PEAK+2
+    mov y+3, TEMP_PEAK+3
+    lcall x_gt_y
+    jnb mf, Skip_Peak
+    mov TEMP_PEAK+0, x+0
+    mov TEMP_PEAK+1, x+1
+    mov TEMP_PEAK+2, x+2
+    mov TEMP_PEAK+3, x+3
+Skip_Peak:
+
+    mov a, cycle_done
+    jz Run_Done
+    mov cycle_done, #0
+    mov ui_mode, #2
+    mov summary_sec, #0
+    mov ui_tick, #0
+Run_Done:
+    ret
+
+Summary_Update:
+    mov power_lvl, #0
+    clr OVEN_PIN
+
+    inc ui_tick
+    mov a, ui_tick
+    cjne a, #10, Summary_Check
+    mov ui_tick, #0
+    inc summary_sec
+Summary_Check:
+    mov a, summary_sec
+    cjne a, #5, Summary_Done
+    mov ui_mode, #0
+Summary_Done:
+    ret
+
+; --- PROFILE HELPERS ---
+Load_Target_Y:
+    mov a, state
+    cjne a, #1, Tgt_Check_S2
+    mov dptr, #Profile_Preheat_Targets
+    sjmp Load_Target_From_Table
+Tgt_Check_S2:
+    cjne a, #2, Tgt_Check_S3
+    mov dptr, #Profile_Soak_Targets
+    sjmp Load_Target_From_Table
+Tgt_Check_S3:
+    cjne a, #3, Tgt_Check_S4
+    mov dptr, #Profile_Reflow_Targets
+    sjmp Load_Target_From_Table
+Tgt_Check_S4:
+    cjne a, #4, Tgt_Default
+    mov dptr, #Profile_Cool_Targets
+    sjmp Load_Target_From_Table
+Tgt_Default:
+    Load_y(0)
+    ret
+
+Load_Target_From_Table:
+    lcall Read_Profile_Byte
+    mov y+0, a
+    mov y+1, #0
+    mov y+2, #0
+    mov y+3, #0
+    ret
+
+Get_Target_Temp:
+    mov a, state
+    cjne a, #1, GetT_Check_S2
+    mov dptr, #Profile_Preheat_Targets
+    sjmp GetT_From_Table
+GetT_Check_S2:
+    cjne a, #2, GetT_Check_S3
+    mov dptr, #Profile_Soak_Targets
+    sjmp GetT_From_Table
+GetT_Check_S3:
+    cjne a, #3, GetT_Check_S4
+    mov dptr, #Profile_Reflow_Targets
+    sjmp GetT_From_Table
+GetT_Check_S4:
+    cjne a, #4, GetT_Default
+    mov dptr, #Profile_Cool_Targets
+    sjmp GetT_From_Table
+GetT_Default:
+    Load_X(0)
+    ret
+
+GetT_From_Table:
+    lcall Read_Profile_Byte
+    mov x+0, a
+    mov x+1, #0
+    mov x+2, #0
+    mov x+3, #0
+    ret
+
+Get_Soak_Time:
+    mov dptr, #Profile_Soak_Times
+    lcall Read_Profile_Byte
+    ret
+
+Read_Profile_Byte:
+    mov a, profile_idx
+    movc a, @a+dptr
+    ret
+
+Send_Profile_Name:
+    mov dptr, #Profile_Names
+    mov a, profile_idx
+    mov b, #4
+    mul ab
+    add a, dpl
+    mov dpl, a
+    mov a, b
+    addc a, dph
+    mov dph, a
+
+    mov r7, #4
+Send_Profile_Name_Loop:
+    clr a
+    movc a, @a+dptr
+    lcall ?WriteData
+    inc dptr
+    djnz r7, Send_Profile_Name_Loop
+    ret
+
+; --- LCD UPDATE ---
+LCD_Update:
+    mov a, ui_mode
+    cjne a, #0, LCD_Check_Run
+    ljmp LCD_Menu
+LCD_Check_Run:
+    cjne a, #1, LCD_Check_Summary
+    ljmp LCD_Run
+LCD_Check_Summary:
+    ljmp LCD_Summary
+
+LCD_Menu:
+    Set_Cursor(1, 1)
+    Send_Constant_String(#Msg_Menu1)
+    Set_Cursor(2, 1)
+    mov a, #'P'
+    lcall ?WriteData
+    mov a, profile_idx
+    add a, #'1'
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    lcall Send_Profile_Name
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #'N'
+    lcall ?WriteData
+    mov a, #'x'
+    lcall ?WriteData
+    mov a, #'t'
+    lcall ?WriteData
+    mov a, #'/'
+    lcall ?WriteData
+    mov a, #'S'
+    lcall ?WriteData
+    mov a, #'t'
+    lcall ?WriteData
+    mov a, #'a'
+    lcall ?WriteData
+    mov a, #'r'
+    lcall ?WriteData
+    mov a, #'t'
+    lcall ?WriteData
+    ret
+
+LCD_Run:
+    ljmp LCD_Run_Page0
+
+LCD_Run_Page0:
+    ; Line 1: Temp:XXXC
+    Set_Cursor(1, 1)
+    Send_Constant_String(#Msg_L1)
+
+    mov x+0, TEMP_TOTAL+0
+    mov x+1, TEMP_TOTAL+1
+    mov x+2, TEMP_TOTAL+2
+    mov x+3, TEMP_TOTAL+3
+    lcall hex2bcd
+
+    mov a, bcd+1
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, bcd+0
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, #'C'
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+
+    ; Line 2: Pn NAME Sx T:YYY
+    Set_Cursor(2, 1)
+    mov a, #'P'
+    lcall ?WriteData
+    mov a, profile_idx
+    add a, #'1'
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    lcall Send_Profile_Name
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #'S'
+    lcall ?WriteData
+    mov a, state
+    add a, #'0'
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #'T'
+    lcall ?WriteData
+    mov a, #':'
+    lcall ?WriteData
+
+    lcall Get_Target_Temp
+    lcall hex2bcd
+
+    mov a, bcd+1
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, bcd+0
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    ret
+
+LCD_Summary:
+    ; Line 1: Done Pn NAME
+    Set_Cursor(1, 1)
+    Send_Constant_String(#Msg_Sum1)
+    mov a, #'P'
+    lcall ?WriteData
+    mov a, profile_idx
+    add a, #'1'
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    lcall Send_Profile_Name
+
+    ; Line 2: Peak:XXX t:TT
+    Set_Cursor(2, 1)
+    mov a, #'P'
+    lcall ?WriteData
+    mov a, #'e'
+    lcall ?WriteData
+    mov a, #'a'
+    lcall ?WriteData
+    mov a, #'k'
+    lcall ?WriteData
+    mov a, #':'
+    lcall ?WriteData
+
+    mov x+0, TEMP_PEAK+0
+    mov x+1, TEMP_PEAK+1
+    mov x+2, TEMP_PEAK+2
+    mov x+3, TEMP_PEAK+3
+    lcall hex2bcd
+
+    mov a, bcd+1
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, bcd+0
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, #' '
+    lcall ?WriteData
+    mov a, #'t'
+    lcall ?WriteData
+    mov a, #':'
+    lcall ?WriteData
+
+    mov x+0, total_sec+0
+    mov x+1, total_sec+1
+    mov x+2, #0
+    mov x+3, #0
+    lcall hex2bcd
+
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, bcd+0
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    ret
+
 
 PutChar:
     push acc
