@@ -2,9 +2,15 @@ $NOLIST
 $MODMAX10
 $LIST
 
-; --- 1. RESET VECTOR ---
+; --- 1. CONFIGURATION ---
+CLK           EQU 16600000 
+TIMER0_RATE   EQU 4096     ; 2048Hz Tone
+TIMER0_RELOAD EQU ((65536-(CLK/TIMER0_RATE)))
+
 ORG 0x0000
     ljmp main
+ORG 0x000B
+    ljmp Timer0_ISR
 
 ; --- 2. VARIABLES ---
 DSEG at 30H
@@ -16,9 +22,8 @@ TEMP_TC:    ds 4
 TEMP_TOTAL: ds 4
 TEMP_PEAK:  ds 4
 
-; FSM & Timing Variables
 state:      ds 1
-sec_count:  ds 1
+sec_count:  ds 1    
 tick_count: ds 1
 power_lvl:  ds 1
 ui_mode:    ds 1
@@ -31,14 +36,18 @@ total_sec:  ds 2
 ui_tick:    ds 1
 summary_sec: ds 1
 cycle_done: ds 1
+
+time_min:   ds 1
+time_sec:   ds 1
+
 buzz_timer: ds 1
-alarm_mode: ds 1    ; 0=Off, 1=Pulse(Done), 2=Error(10 beeps)
-beep_count: ds 1    ; Counts beeps
+alarm_mode: ds 1
+beep_count: ds 1
 
 BSEG
 mf:         dbit 1
 
-; --- 3. PIN DEFINITIONS ---
+; --- 3. PINS ---
 ELCD_RS equ P0.2
 ELCD_E  equ P0.4
 ELCD_D4 equ P1.1
@@ -58,20 +67,21 @@ $include(math32.inc)
 $include(LCD_4bit_DE10Lite_no_RW.inc)
 $LIST
 
-; --- 5. CONSTANTS & STRINGS ---
+; --- 5. CONSTANTS ---
 LUT: DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90
 
-; LCD Strings
 Msg_Menu:    db 'Select Profile', 0
 Msg_Run:     db 'Reflow Run...', 0
 Msg_Done:    db 'DONE! Cool Down', 0
 Msg_Error:   db 'ERR: Low Temp!', 0
 Msg_Abort:   db 'ABORTED!', 0
 Msg_Temp:    db 'Tmp:', 0
-Msg_Time:    db 't:', 0
 Msg_Peak:    db 'Peak:', 0
 
-; State Names for LCD
+; Receipt Strings (Fun Feature)
+Msg_Rcpt1:   db 13, 10, '--- REFLOW DONE ---', 13, 10, 0
+Msg_Rcpt2:   db 'Status: CRISPY', 13, 10, 0
+
 Msg_St_Pre:  db 'Preht ', 0
 Msg_St_Soak: db 'Soak  ', 0
 Msg_St_Refl: db 'Reflw ', 0
@@ -83,20 +93,42 @@ Profile_Names:
     db 'LFRE'
     db 'LOW '
 
-; Profile params per index: 0..2
 Profile_Preheat_Targets: db 150, 150, 130
 Profile_Soak_Targets:    db 150, 170, 140
 Profile_Soak_Times:      db 60,  90,  45
 Profile_Reflow_Targets:  db 220, 235, 200
 Profile_Cool_Targets:    db 60,  60,  60
 
-; --- 6. INITIALIZATION ---
+; --- 6. ISRs ---
+Timer0_Init:
+    mov a, TMOD
+    anl a, #0xF0
+    orl a, #0x01
+    mov TMOD, a
+    mov TH0, #high(TIMER0_RELOAD)
+    mov TL0, #low(TIMER0_RELOAD)
+    setb ET0
+    setb EA
+    clr TR0
+    ret
+
+Timer0_ISR:
+    clr TR0
+    mov TH0, #high(TIMER0_RELOAD)
+    mov TL0, #low(TIMER0_RELOAD)
+    setb TR0
+    cpl BUZZ_PIN
+    reti
+
+; --- 7. INIT ---
 Init:
     mov SP, #0x7F
-    mov P0MOD, #0xBD ; P0.1, P0.6 Inputs
-    mov P1MOD, #0x16 ; P1.4, P1.2, P1.1 Outputs
+    mov P0MOD, #0xBD 
+    mov P1MOD, #0x16 
+    
+    ; *** BONUS: Set Port 2 (LEDs) to Output ***
+    mov P2MOD, #0xFF
 
-    ; State Init
     mov state, #0
     mov sec_count, #0
     mov tick_count, #0
@@ -110,21 +142,27 @@ Init:
     mov total_sec+0, #0
     mov total_sec+1, #0
     mov cycle_done, #0
+    
+    mov time_min, #0
+    mov time_sec, #0
+    
     mov buzz_timer, #0
     mov alarm_mode, #0
     mov beep_count, #0
 
-    ; Pin Init
     clr OVEN_PIN     
     setb BTN_PIN     
     setb BTN2_PIN    
     setb TXD_PIN     
     clr BUZZ_PIN     
+    
+    mov P2, #0x00 ; LEDs Off
 
+    lcall Timer0_Init
     lcall ELCD_4BIT  
     ret
 
-; --- 7. UTILS ---
+; --- 8. UTILS ---
 Wait50ms:
     mov R0, #30
 Wait_L3: mov R1, #74
@@ -150,9 +188,8 @@ Read_ADC_mV:
     lcall div32
     ret
 
-; --- 8. STATE MACHINE ---
+; --- 9. FSM ---
 FSM_Update:
-    ; 1. Global Overheat Safety (>245C) -> ABORT
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, #0
@@ -161,17 +198,12 @@ FSM_Update:
     lcall x_gt_y
     jb mf, Jump_Abort_Error
 
-    ; 2. Requirement 7: Thermocouple Safety (<50C at 60s)
     mov a, state
     jz Check_States
-    
-    ; Check if Total Time is exactly 60 seconds
     mov a, total_sec+0
     cjne a, #60, Check_States
     mov a, total_sec+1
     jnz Check_States 
-    
-    ; Time is 60s. Check Temp < 50.
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, #0
@@ -215,12 +247,12 @@ Force_Abort_LowTemp:
     mov state, #0
     mov power_lvl, #0
     clr OVEN_PIN
-    mov ui_mode, #3     ; Show Error Msg
+    mov ui_mode, #3     
     mov alarm_mode, #2  
     mov beep_count, #20 
     ret
 
-; [S1] PREHEAT
+; STATES
 State1_Preheat:
     mov power_lvl, #5
     mov x+0, TEMP_TOTAL+0
@@ -229,19 +261,14 @@ State1_Preheat:
     mov x+3, #0
     lcall Load_Target_Y
     lcall x_gt_y
-    
-    ; FIX: Inverted Logic to avoid long Jump
     jb mf, S1_Done
     ret             
-
 S1_Done:
-    ; Transition -> S2
     mov state, #2
     mov sec_count, #0
-    mov buzz_timer, #5 
+    mov buzz_timer, #5  
     ret
 
-; [S2] SOAK
 State2_Soak:
     lcall Get_Soak_Time
     mov b, a
@@ -250,8 +277,6 @@ State2_Soak:
     sjmp Soak_Done
 Check_Time_S2:
     jnc Soak_Done
-
-    ; Feedback Control
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, #0
@@ -261,19 +286,15 @@ Check_Time_S2:
     jb mf, Soak_Heat_On
     mov power_lvl, #0 
     ret
-
 Soak_Heat_On:
     mov power_lvl, #1 
     ret
-
 Soak_Done:
-    ; Transition -> S3
     mov state, #3
     mov sec_count, #0
-    mov buzz_timer, #5 
+    mov buzz_timer, #5  
     ret
 
-; [S3] REFLOW
 State3_Reflow:
     mov power_lvl, #5
     mov x+0, TEMP_TOTAL+0
@@ -282,19 +303,14 @@ State3_Reflow:
     mov x+3, #0
     lcall Load_Target_Y
     lcall x_gt_y
-    
-    ; FIX: Inverted Logic
     jb mf, S3_Done
     ret
-
 S3_Done:
-    ; Transition -> S4
     mov state, #4
     mov sec_count, #0
-    mov buzz_timer, #5 
+    mov buzz_timer, #5  
     ret
 
-; [S4] COOL
 State4_Cool:
     mov power_lvl, #0
     mov x+0, TEMP_TOTAL+0
@@ -303,67 +319,75 @@ State4_Cool:
     mov x+3, #0
     lcall Load_Target_Y
     lcall x_lt_y
-    
-    ; FIX: Inverted Logic
     jb mf, S4_Done
     ret
-
 S4_Done:
-    ; DONE
     mov state, #0
     mov cycle_done, #1
     mov alarm_mode, #1 
     mov beep_count, #10 
+    
+    ; *** BONUS: PRINT SERIAL RECEIPT ***
+    lcall Send_Receipt
     ret
 
-; --- 9. PWM & TIMING ---
+; --- 10. TIMING & PWM ---
 Update_Timing:
-    ; --- BUZZER LOGIC ---
     mov a, alarm_mode
-    jz Normal_Buzz
-    
-    ; Alarm active: Pulse logic (every 5 ticks = 0.5s)
+    jz Check_Single_Beep
     mov a, tick_count
     cjne a, #0, Check_Tick5
-    sjmp Toggle_Alarm
+    sjmp Toggle_Tone
 Check_Tick5:
     cjne a, #5, Timing_Ticks
-Toggle_Alarm:
+Toggle_Tone:
     mov a, beep_count
     jz Stop_Alarm
     dec beep_count
-    cpl BUZZ_PIN
+    cpl TR0 
     sjmp Timing_Ticks
 Stop_Alarm:
     mov alarm_mode, #0
-    clr BUZZ_PIN
+    clr TR0      
+    clr BUZZ_PIN 
     sjmp Timing_Ticks
-
-Normal_Buzz:
-    ; Short beep
+Check_Single_Beep:
     mov a, buzz_timer
-    jz Buzz_Off
+    jz Silence_Buzzer
     dec buzz_timer
-    setb BUZZ_PIN
+    setb TR0     
     sjmp Timing_Ticks
-Buzz_Off:
-    clr BUZZ_PIN
+Silence_Buzzer:
+    clr TR0      
+    clr BUZZ_PIN 
 
 Timing_Ticks:
     inc tick_count
     mov a, tick_count
     cjne a, #10, PWM_Control
     mov tick_count, #0
+    
+    ; --- DISPLAY TIMER ---
     inc sec_count
     inc total_sec+0
     mov a, total_sec+0
-    jnz PWM_Control
+    jnz Update_Display_Timer
     inc total_sec+1
 
+Update_Display_Timer:
+    inc time_sec
+    mov a, time_sec
+    cjne a, #60, PWM_Control
+    mov time_sec, #0
+    inc time_min
+
+; --- BONUS: LED POWER METER ---
 PWM_Control:
     mov a, power_lvl
     cjne a, #5, Check_20
-    setb OVEN_PIN ; 100%
+    ; 100%
+    setb OVEN_PIN 
+    mov P2, #0xFF  ; LEDs ON
     ret
 Check_20:
     cjne a, #1, Force_Off
@@ -371,15 +395,18 @@ Check_20:
     cjne a, #2, Tick_Low
     sjmp Force_Off
 Tick_Low:
-    jc Turn_On ; 0, 1 -> ON
+    ; 20% (Pulsing)
+    jc Turn_On 
 Force_Off:
     clr OVEN_PIN
+    mov P2, #0x00  ; LEDs OFF
     ret
 Turn_On:
     setb OVEN_PIN
+    mov P2, #0x03  ; LEDs DIM (2 lights)
     ret
 
-; --- 10. MAIN LOOP ---
+; --- 11. MAIN LOOP ---
 main:
     lcall Init
 
@@ -412,21 +439,22 @@ Loop:
     ; 2. Logic & IO
     lcall Read_Buttons
     
-    ; Alarm Clear
     mov a, alarm_mode
-    jz Input_Check
+    jz Run_IO
     mov a, btn1_event
     orl a, btn2_event
-    jz Input_Check
+    jz Run_IO
     mov alarm_mode, #0 
+    clr TR0        
     clr BUZZ_PIN
     mov btn1_event, #0   
     mov btn2_event, #0
     
-Input_Check:
+Run_IO:
+    lcall Update_Timing 
     lcall UI_Update
     lcall LCD_Update
-    lcall Update_7Seg       ; <--- UPDATED: Professional 7-Seg Logic
+    lcall Update_7Seg
     lcall Send_Temp_Serial
     ljmp Loop
 
@@ -490,12 +518,14 @@ Menu_Update:
 Check_Start:
     mov a, btn2_event
     jz Menu_Done
-    ; Start Reflow
+    ; Reset Timers for new run
     mov ui_mode, #1
     mov state, #1
     mov sec_count, #0
     mov total_sec+0, #0
     mov total_sec+1, #0
+    mov time_min, #0
+    mov time_sec, #0
     mov TEMP_PEAK+0, #0
     mov TEMP_PEAK+1, #0
     mov TEMP_PEAK+2, #0
@@ -504,15 +534,12 @@ Menu_Done:
     ret
 
 Running_Update:
-    ; ABORT CHECK: BTN2 stops everything
     mov a, btn2_event
     jz Run_Normal
     ljmp Force_Abort_User
 Run_Normal:
     lcall FSM_Update
-    lcall Update_Timing
     
-    ; Track Peak
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov y+0, TEMP_PEAK+0
@@ -543,7 +570,6 @@ Summary_Update:
     clr OVEN_PIN
     mov a, alarm_mode
     jnz Sum_Ret
-    
     inc ui_tick
     mov a, ui_tick
     cjne a, #10, Sum_Ret
@@ -556,7 +582,6 @@ Sum_Ret:
     ret
 
 Error_Update:
-    ; Wait for user to acknowledge error (btn press)
     mov a, btn1_event
     orl a, btn2_event
     jz Err_Ret
@@ -565,7 +590,6 @@ Err_Ret:
     ret
 
 ; --- HELPERS ---
-; FIXED: Use ljmp to solve relative offset errors
 Load_Target_Y:
     mov a, state
     cjne a, #1, Check_T2
@@ -581,7 +605,6 @@ Check_T3:
     ljmp Load_T_Jump
 Check_T4: 
     mov dptr, #Profile_Cool_Targets
-    ; Fall through
 Load_T_Jump:
     lcall Read_Profile_Byte
     mov y+0, a
@@ -627,49 +650,58 @@ Spn_Loop:
     djnz r7, Spn_Loop
     ret
 
-; --- DISPLAY UPDATE ROUTINES (PROFESSIONAL LOOK) ---
-
-; 1. 7-SEGMENT DISPLAY UPDATE
+; --- DISPLAYS ---
 Update_7Seg:
     mov dptr, #LUT
-
-    ; --- LEFT SIDE: PROFILE (HEX 5, 4) ---
-    ; Display "P x" (Profile Index + 1)
-    mov HEX5, #0x8C      ; 'P'
-    
-    mov a, profile_idx
-    add a, #1            ; Make it 1-based (1, 2, 3)
-    movc a, @a+dptr      ; Convert to 7-seg
-    mov HEX4, a
-
-    ; HEX 3: Blank
-    mov HEX3, #0xFF      
-
-    ; --- RIGHT SIDE: TEMP (HEX 2, 1, 0) ---
+    ; Temp
     mov x+0, TEMP_TOTAL+0
     mov x+1, TEMP_TOTAL+1
     mov x+2, #0
     mov x+3, #0
     lcall hex2bcd
-    
     mov a, bcd+1
     anl a, #0x0F
     movc a, @a+dptr
-    mov HEX2, a          ; Hundreds
-
+    mov HEX5, a
     mov a, bcd+0
     swap a
     anl a, #0x0F
     movc a, @a+dptr
-    mov HEX1, a          ; Tens
-
+    mov HEX4, a
     mov a, bcd+0
     anl a, #0x0F
     movc a, @a+dptr
-    mov HEX0, a          ; Ones
+    mov HEX3, a
+
+    ; Time (Seconds)
+    mov x+0, sec_count
+    mov x+1, #0
+    lcall hex2bcd
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX2, a
+    mov a, bcd+0
+    anl a, #0x0F
+    movc a, @a+dptr
+    mov HEX1, a
+
+    ; State
+    mov a, state
+    movc a, @a+dptr
+    mov HEX0, a
     ret
 
-; 2. LCD UPDATE
+; --- CLEAR HELPER (FIXES GHOSTING) ---
+Clear_Rest_Of_Line:
+    mov r7, #10 
+Clear_Loop:
+    mov a, #' '
+    lcall ?WriteData
+    djnz r7, Clear_Loop
+    ret
+
 LCD_Update:
     mov a, ui_mode
     cjne a, #0, Check_Run_Mode
@@ -685,24 +717,19 @@ Check_Error_Mode:
 
 LCD_Show_Menu:
     Set_Cursor(1, 1)
-    Send_Constant_String(#Msg_Menu) ; "Select Profile"
+    Send_Constant_String(#Msg_Menu)
     Set_Cursor(2, 1)
     mov a, #'>'          
     lcall ?WriteData
     mov a, #' '
     lcall ?WriteData
     lcall Send_Profile_Name
-    ; Clear rest of line
-    mov a, #' '
-    lcall ?WriteData
-    lcall ?WriteData
-    lcall ?WriteData
+    lcall Clear_Rest_Of_Line ; <--- Fix
     ret
 
 LCD_Show_Status:
-    ; Line 1: "Tmp: 125C"
     Set_Cursor(1, 1)
-    Send_Constant_String(#Msg_Temp) ; "Tmp:"
+    Send_Constant_String(#Msg_Temp)
     mov a, #' '
     lcall ?WriteData
     mov x+0, TEMP_TOTAL+0
@@ -710,15 +737,23 @@ LCD_Show_Status:
     lcall Hex2BCD_Display
     mov a, #'C'
     lcall ?WriteData
+    lcall Clear_Rest_Of_Line ; <--- Fix
     
-    ; Line 2: "St: Soak 45s"
     Set_Cursor(2, 1)
     mov a, state
     lcall Send_State_Name
-    
     mov a, #' '
     lcall ?WriteData
-    mov x+0, sec_count
+    mov x+0, time_min
+    mov x+1, #0
+    lcall hex2bcd
+    mov a, bcd+0
+    anl a, #0x0F
+    add a, #'0'
+    lcall ?WriteData
+    mov a, #':'
+    lcall ?WriteData
+    mov x+0, time_sec
     mov x+1, #0
     lcall hex2bcd
     mov a, bcd+0
@@ -730,8 +765,7 @@ LCD_Show_Status:
     anl a, #0x0F
     add a, #'0'
     lcall ?WriteData
-    mov a, #'s'
-    lcall ?WriteData
+    lcall Clear_Rest_Of_Line ; <--- Fix
     ret
 
 LCD_Show_Summary:
@@ -746,6 +780,7 @@ LCD_Show_Summary:
     lcall Hex2BCD_Display
     mov a, #'C'
     lcall ?WriteData
+    lcall Clear_Rest_Of_Line ; <--- Fix
     ret
 
 LCD_Show_Error:
@@ -753,6 +788,7 @@ LCD_Show_Error:
     Send_Constant_String(#Msg_Error)
     Set_Cursor(2, 1)
     Send_Constant_String(#Msg_Abort)
+    lcall Clear_Rest_Of_Line
     ret
 
 Send_State_Name:
@@ -794,7 +830,7 @@ Hex2BCD_Display:
     lcall ?WriteData
     ret
 
-; --- SERIAL (Python Graph) ---
+; --- SERIAL ---
 Send_Temp_Serial:
     mov a, #'T'
     lcall PutChar
@@ -818,10 +854,71 @@ Send_Temp_Serial:
     anl a, #0x0F
     add a, #'0'
     lcall PutChar
+    
+    mov a, #','
+    lcall PutChar
+    mov a, #'G'
+    lcall PutChar
+    mov a, #':'
+    lcall PutChar
+    lcall Get_Target_Temp
+    lcall hex2bcd
+    mov a, bcd+1
+    anl a, #0x0F
+    add a, #'0'
+    lcall PutChar
+    mov a, bcd+0
+    swap a
+    anl a, #0x0F
+    add a, #'0'
+    lcall PutChar
+    mov a, bcd+0
+    anl a, #0x0F
+    add a, #'0'
+    lcall PutChar
+
+    mov a, #','
+    lcall PutChar
+    mov a, #'S'
+    lcall PutChar
+    mov a, #':'
+    lcall PutChar
+    mov a, state
+    add a, #'0'
+    lcall PutChar
+    
+    mov a, #','
+    lcall PutChar
+    mov a, #'P'
+    lcall PutChar
+    mov a, #':'
+    lcall PutChar
+    mov a, power_lvl
+    add a, #'0'
+    lcall PutChar
+    
     mov a, #10
     lcall PutChar
     mov a, #13
     lcall PutChar
+    ret
+
+; --- BONUS: SEND RECEIPT ---
+Send_Receipt:
+    mov dptr, #Msg_Rcpt1
+    lcall Send_Serial_String
+    mov dptr, #Msg_Rcpt2
+    lcall Send_Serial_String
+    ret
+
+Send_Serial_String:
+    clr a
+    movc a, @a+dptr
+    jz Send_Ret
+    lcall PutChar
+    inc dptr
+    sjmp Send_Serial_String
+Send_Ret:
     ret
 
 PutChar:
@@ -850,3 +947,4 @@ L_Wait:
     ret
 
 END
+;WORKS
